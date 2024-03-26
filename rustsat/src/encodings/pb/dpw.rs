@@ -137,13 +137,10 @@ impl BoundUpper for DynamicPolyWatchdog {
         match &self.structure {
             Some(structure) => {
                 let output_weight = 1 << (structure.output_power());
-                if output_weight == 1 {
-                    return ub;
-                }
                 if ub < output_weight {
                     return ub;
                 }
-                ub / output_weight * output_weight - 1
+                (ub + 1) / output_weight * output_weight - 1
             }
             None => ub,
         }
@@ -688,10 +685,13 @@ mod tests {
         let mut dpw = DynamicPolyWatchdog::from(lits);
         let mut var_manager = BasicVarManager::default();
         let mut cnf = Cnf::new();
-        dpw.encode_ub(0..=23, &mut cnf, &mut var_manager);
-        for ub in 8..=23 {
+        dpw.encode_ub(0..23, &mut cnf, &mut var_manager);
+        for ub in 7..23 {
             let coarse_ub = dpw.coarse_ub(ub);
             debug_assert!(coarse_ub <= ub);
+            if ub % 8 == 7 {
+                debug_assert_eq!(coarse_ub, ub);
+            }
             let assumps = dpw.enforce_ub(coarse_ub).unwrap();
             debug_assert_eq!(assumps.len(), 1);
         }
