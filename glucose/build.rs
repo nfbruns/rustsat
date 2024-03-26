@@ -11,7 +11,7 @@ fn main() {
     build(
         "https://github.com/chrjabs/glucose4.git",
         "main",
-        "7446ea43cd7b0beb8778de00fc373849983ad067",
+        "a244a12a3f34da6c93377a6196291494fddf491e",
     );
 
     let out_dir = env::var("OUT_DIR").unwrap();
