@@ -204,7 +204,7 @@ impl Cnf {
     ///
     /// For performance, consider using a [`std::io::BufWriter`] instance.
     pub fn to_dimacs<W: io::Write>(&self, writer: &mut W, n_vars: u32) -> Result<(), io::Error> {
-        fio::dimacs::write_cnf_annotated(writer, &self, n_vars)
+        fio::dimacs::write_cnf_annotated(writer, self, n_vars)
     }
 }
 
