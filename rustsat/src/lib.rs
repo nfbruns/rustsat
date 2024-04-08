@@ -61,9 +61,6 @@
 //! crate](https://crates.io/crates/rustsat_tools) at `tools/src/bin`. For a bigger
 //! example you can look at this [multi-objective optimization
 //! solver](https://github.com/chrjabs/scuttle).
-//!
-//! For an example of how to use the C-API, see `rustsat/examples/capi*.cpp`.
-//! Similarly, for an example of using the Python API, see `rustsat/examples/pyapi*.py`.
 
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(feature = "bench", feature(test))]
@@ -73,7 +70,6 @@ pub mod instances;
 pub mod solvers;
 pub mod types;
 
-mod capi;
 #[cfg(feature = "pyapi")]
 pub mod pyapi;
 
