@@ -38,7 +38,7 @@ jobs:
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: ${{ fromJSON('["", "4"]')[matrix.os == 'macos-latest'] }}
       - name: Cargo test
-        run: cargo test -p rustsat-pyapi --verbose --features=all
+        run: cargo test -p rustsat-pyapi --verbose
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: ${{ fromJSON('["", "4"]')[matrix.os == 'macos-latest'] }}
 
