@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check
-        run: [ "$(grep '^version = ' rustsat/Cargo.toml)" = "$(grep '^version = ' pyapi/Cargo.toml)" ]
+        run: "[ \"$(grep '^version = ' rustsat/Cargo.toml)\" = \"$(grep '^version = ' pyapi/Cargo.toml)\" ]"
 
   linux:
     runs-on: ubuntu-latest

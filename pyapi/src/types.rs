@@ -64,7 +64,7 @@ impl Lit {
     }
 
     fn __richcmp__(&self, other: &Lit, op: pyo3::basic::CompareOp) -> bool {
-        op.matches(self.cmp(&other))
+        op.matches(self.cmp(other))
     }
 
     fn __hash__(&self) -> u64 {
@@ -75,6 +75,7 @@ impl Lit {
     }
 
     /// Gets the IPASIR/DIMACS representation of the literal
+    #[allow(clippy::wrong_self_convention)]
     fn to_ipasir(&self) -> c_int {
         let negated = self.0.is_neg();
         let idx: c_int = (self.0.vidx() + 1)
@@ -236,6 +237,6 @@ impl ClauseIter {
             slf.index += 1;
             return Ok(Some(Lit(slf.clause.borrow(slf.py()).cl[slf.index - 1])));
         }
-        return Ok(None);
+        Ok(None)
     }
 }

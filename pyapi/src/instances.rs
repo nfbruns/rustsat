@@ -133,7 +133,7 @@ impl Cnf {
     #[new]
     #[pyo3(text_signature = "(clauses = [])")]
     fn new(clauses: Vec<Clause>) -> Self {
-        RsCnf::from_iter(clauses.into_iter().map(|cl| Into::<RsClause>::into(cl))).into()
+        RsCnf::from_iter(clauses.into_iter().map(Into::<RsClause>::into)).into()
     }
 
     fn __repr__(&self) -> String {
