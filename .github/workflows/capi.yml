@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check
-        run: [ "$(grep '^version = ' rustsat/Cargo.toml)" = "$(grep '^version = ' capi/Cargo.toml)" ]
+        run: "[ \"$(grep '^version = ' rustsat/Cargo.toml)\" = \"$(grep '^version = ' capi/Cargo.toml)\" ]"
 
   cbindgen:
     name: Test generated C header

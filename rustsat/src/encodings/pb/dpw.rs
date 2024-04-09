@@ -72,9 +72,11 @@ impl DynamicPolyWatchdog {
     /// Helper for the C-API to add input literals to an already existing object. Errors if the
     /// object is already encoded.
     #[cfg(feature = "internals")]
-    pub fn add_input(&mut self, lit: Lit, weight: usize) -> Result<(), ()> {
+    pub fn add_input(&mut self, lit: Lit, weight: usize) -> Result<(), crate::NotAllowed> {
         if self.structure.is_some() {
-            return Err(());
+            return Err(crate::NotAllowed(
+                "cannot add inputs after building the encoding",
+            ));
         }
         if let Some(lweight) = self.in_lits.get_mut(&lit) {
             *lweight += weight;

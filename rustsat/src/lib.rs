@@ -65,12 +65,25 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(feature = "bench", feature(test))]
 
+use core::fmt;
+
+use thiserror::Error;
+
 pub mod encodings;
 pub mod instances;
 pub mod solvers;
 pub mod types;
 
 pub mod utils;
+
+#[derive(Error, Debug)]
+pub struct NotAllowed(&'static str);
+
+impl fmt::Display for NotAllowed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "action not allowed: {}", self.0)
+    }
+}
 
 #[cfg(feature = "bench")]
 #[cfg(test)]
