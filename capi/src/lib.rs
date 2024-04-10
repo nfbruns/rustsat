@@ -22,13 +22,19 @@ pub mod encodings {
     #[repr(C)]
     pub enum MaybeError {
         /// No error
-        Ok,
+        Ok = 0,
         /// Encode was not called before using the encoding
         NotEncoded,
         /// The requested encoding is unsatisfiable
         Unsat,
         /// The encoding is in an invalid state to perform this action
         InvalidState,
+        /// Invalid IPASIR-style literal
+        InvalidLiteral,
+        /// Precision divisor is not a power of 2
+        PrecisionNotPow2,
+        /// Attempting to decrease precision
+        PrecisionDecreased,
     }
 
     impl From<encodings::Error> for MaybeError {
@@ -36,6 +42,20 @@ pub mod encodings {
             match value {
                 encodings::Error::NotEncoded => MaybeError::NotEncoded,
                 encodings::Error::Unsat => MaybeError::Unsat,
+            }
+        }
+    }
+
+    impl From<Result<(), encodings::pb::dpw::PrecisionError>> for MaybeError {
+        fn from(value: Result<(), encodings::pb::dpw::PrecisionError>) -> Self {
+            match value {
+                Ok(_) => MaybeError::Ok,
+                Err(err) => match err {
+                    encodings::pb::dpw::PrecisionError::NotPow2 => MaybeError::PrecisionNotPow2,
+                    encodings::pb::dpw::PrecisionError::PrecisionDecreased => {
+                        MaybeError::PrecisionDecreased
+                    }
+                },
             }
         }
     }
@@ -146,15 +166,26 @@ pub mod encodings {
 
         /// Adds a new input literal to a [`DbTotalizer`]
         ///
+        /// # Errors
+        ///
+        /// - If `lit` is not a valid IPASIR-style literal (e.g., `lit = 0`),
+        ///   [`MaybeError::InvalidLiteral`] is returned
+        ///
         /// # Safety
         ///
         /// `tot` must be a return value of [`tot_new`] that [`tot_drop`] has
         /// not yet been called on.
         #[no_mangle]
-        pub unsafe extern "C" fn tot_add(tot: *mut DbTotalizer, lit: c_int) {
+        pub unsafe extern "C" fn tot_add(tot: *mut DbTotalizer, lit: c_int) -> MaybeError {
             let mut boxed = unsafe { Box::from_raw(tot) };
-            boxed.extend([Lit::from_ipasir(lit).expect("invalid IPASIR literal")]);
+            let lit = if let Ok(lit) = Lit::from_ipasir(lit) {
+                lit
+            } else {
+                return MaybeError::InvalidLiteral;
+            };
+            boxed.extend([lit]);
             Box::into_raw(boxed);
+            MaybeError::Ok
         }
 
         /// Lazily builds the _change in_ cardinality encoding to enable upper
@@ -301,9 +332,14 @@ pub mod encodings {
             Box::into_raw(Box::default())
         }
 
-        /// Adds a new input literal to a [`DynamicPolyWatchdog`]. Input
-        /// literals can only be added _before_ the encoding is built for the
-        /// first time. Otherwise [`MaybeError::InvalidState`] is returned.
+        /// Adds a new input literal to a [`DynamicPolyWatchdog`].
+        ///
+        /// # Errors
+        ///
+        /// - If `lit` is not a valid IPASIR-style literal (e.g., `lit = 0`),
+        ///   [`MaybeError::InvalidLiteral`] is returned
+        /// - If a literal is added _after_ the encoding is build, [`MaybeError::InvalidState`] is
+        ///   returned
         ///
         /// # Safety
         ///
@@ -316,10 +352,12 @@ pub mod encodings {
             weight: usize,
         ) -> MaybeError {
             let mut boxed = unsafe { Box::from_raw(dpw) };
-            let res = boxed.add_input(
-                Lit::from_ipasir(lit).expect("invalid IPASIR literal"),
-                weight,
-            );
+            let lit = if let Ok(lit) = Lit::from_ipasir(lit) {
+                lit
+            } else {
+                return MaybeError::InvalidLiteral;
+            };
+            let res = boxed.add_input(lit, weight);
             Box::into_raw(boxed);
             if res.is_ok() {
                 MaybeError::Ok
@@ -407,6 +445,47 @@ pub mod encodings {
         pub unsafe extern "C" fn dpw_coarse_ub(dpw: *mut DynamicPolyWatchdog, ub: usize) -> usize {
             let boxed = unsafe { Box::from_raw(dpw) };
             let ret = boxed.coarse_ub(ub);
+            Box::into_raw(boxed);
+            ret
+        }
+
+        /// Set the precision at which to build the encoding at. With `divisor = 8` the encoding will
+        /// effectively be built such that the weight of every input literal is divided by `divisor`
+        /// (interger division, rounding down). Divisor values must be powers of 2. After building
+        /// the encoding, the precision can only be increased, i.e., only call this function with
+        /// _decreasing_ divisor values.
+        ///
+        /// # Errors
+        ///
+        /// - If `divisor` is not a power of 2, [`MaybeError::PrecisionNotPow2`] is returned
+        /// - If `divisor` is larger than the last divisor, i.e., precision is attemted to be
+        ///   decreased, [`MaybeError::PrecisionDecreased`] is returned
+        ///
+        /// # Safety
+        ///
+        /// `dpw` must be a return value of [`dpw_new`] that [`dpw_drop`] has
+        /// not yet been called on.
+        #[no_mangle]
+        pub unsafe extern "C" fn dpw_set_precision(
+            dpw: *mut DynamicPolyWatchdog,
+            divisor: usize,
+        ) -> MaybeError {
+            let mut boxed = unsafe { Box::from_raw(dpw) };
+            let ret = boxed.set_precision(divisor).into();
+            Box::into_raw(boxed);
+            ret
+        }
+
+        /// Gets the next possible precision divisor value
+        ///
+        /// Note that this is not the next possible precision value from the last _set_ precision but
+        /// from the last _encoded_ precision. The divisor value will always be a power of two so that
+        /// calling `set_precision` and then encoding will produce the smalles non-empty next segment
+        /// of the encoding.
+        #[no_mangle]
+        pub unsafe extern "C" fn dpw_next_precision(dpw: *mut DynamicPolyWatchdog) -> usize {
+            let boxed = unsafe { Box::from_raw(dpw) };
+            let ret = boxed.next_precision();
             Box::into_raw(boxed);
             ret
         }

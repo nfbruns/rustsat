@@ -14,6 +14,7 @@
 //!   Watchdog Encoding for Solving Weighted MaxSAT_, SAT 2018.
 
 use std::{
+    cmp,
     collections::BTreeMap,
     num::{NonZeroU8, NonZeroUsize},
     ops::RangeBounds,
@@ -21,7 +22,8 @@ use std::{
 
 use crate::{
     encodings::{
-        card::dbtotalizer::{Node, TotDb},
+        atomics,
+        card::dbtotalizer::{GeneralNode, LitData, Node, TotDb, UnitNode},
         nodedb::{NodeById, NodeCon, NodeId, NodeLike},
         CollectClauses, EncodeStats, Error, IterWeightedInputs,
     },
@@ -31,6 +33,19 @@ use crate::{
 };
 
 use super::{BoundUpper, BoundUpperIncremental, Encode, EncodeIncremental};
+
+type WeightQ = BTreeMap<usize, Vec<NodeCon>>;
+
+/// Errors related to incremental precision
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum PrecisionError {
+    /// Precision divisor was not a power of 2
+    #[error("precision divisor must be a power of 2")]
+    NotPow2,
+    /// Precision divisor was higher than previous one
+    #[error("precision can only be increased")]
+    PrecisionDecreased,
+}
 
 /// Implementation of the dynamic polynomial watchdog (DPW) encoding \[1\].
 ///
@@ -50,6 +65,10 @@ pub struct DynamicPolyWatchdog {
     in_lits: RsHashMap<Lit, usize>,
     /// The encoding root and the tares
     structure: Option<Structure>,
+    /// Queue by weight of children that still have to be added to the tree
+    weight_queue: WeightQ,
+    /// The current precision divisor of the encoding
+    prec_div: usize,
     /// Sum of all input weight
     weight_sum: usize,
     /// The number of variables
@@ -64,7 +83,7 @@ impl DynamicPolyWatchdog {
     /// Gets the maximum depth of the tree
     pub fn depth(&self) -> usize {
         match &self.structure {
-            Some(Structure { root, .. }) => self.db[*root].depth(),
+            Some(structure) => self.db[structure.root()].depth(),
             None => 0,
         }
     }
@@ -84,21 +103,67 @@ impl DynamicPolyWatchdog {
             self.in_lits.insert(lit, weight);
         }
         self.weight_sum += weight;
+        let node = self.db.insert(Node::Leaf(lit));
+        let con = NodeCon::full(node);
+        if let Some(cons) = self.weight_queue.get_mut(&weight) {
+            cons.push(con);
+        } else {
+            self.weight_queue.insert(weight, vec![con]);
+        }
         Ok(())
+    }
+
+    /// Set the precision at which to build the encoding at. With `divisor = 8` the encoding will
+    /// effectively be built such that the weight of every input literal is divided by `divisor`
+    /// (interger division, rounding down). Divisor values must be powers of 2. After building
+    /// the encoding, the precision can only be increased, i.e., only call this function with
+    /// _decreasing_ divisor values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the divisor value is not a power of 2 or was increased.
+    pub fn set_precision(&mut self, divisor: usize) -> Result<(), PrecisionError> {
+        if !(divisor <= 1 || (divisor & (divisor - 1)) == 0) {
+            return Err(PrecisionError::NotPow2);
+        }
+        if self.structure.is_some() && divisor > self.prec_div {
+            return Err(PrecisionError::PrecisionDecreased);
+        }
+        self.prec_div = divisor;
+        Ok(())
+    }
+
+    /// Gets the next possible precision divisor value
+    ///
+    /// Note that this is not the next possible precision value from the last _set_ precision but
+    /// from the last _encoded_ precision. The divisor value will always be a power of two so that
+    /// calling `set_precision` and then encoding will produce the smalles non-empty next segment
+    /// of the encoding.
+    pub fn next_precision(&self) -> usize {
+        if self.weight_queue.is_empty() {
+            return 1;
+        }
+        let digits = utils::digits(*self.weight_queue.iter().next_back().unwrap().0, 2) as usize;
+        1 << (digits - 1)
     }
 }
 
 #[cfg_attr(feature = "internals", visibility::make(pub))]
 #[derive(Clone)]
 pub(crate) struct Structure {
-    /// The root of the structure
-    pub root: NodeId,
+    /// The bottom buckets of the encoding. The first one of them is the root of the encoding.
+    /// Sorted from highest to lowest.
+    pub bottom_buckets: Vec<NodeId>,
     /// The tare variables needed to enforce specific bounds. First in vector is
     /// the tare to the second largest top bucket, then decreasing.
     pub tares: Vec<Lit>,
 }
 
 impl Structure {
+    /// Gets the root of the structure
+    pub fn root(&self) -> NodeId {
+        self.bottom_buckets[0]
+    }
     /// Gets the power of the output literals (they represent a weight of
     /// 2^power)
     pub fn output_power(&self) -> usize {
@@ -122,8 +187,8 @@ impl IterWeightedInputs for DynamicPolyWatchdog {
 
 impl EncodeIncremental for DynamicPolyWatchdog {
     fn reserve(&mut self, var_manager: &mut dyn ManageVars) {
-        if let Some(Structure { root, .. }) = &self.structure {
-            self.db.reserve_vars(*root, var_manager);
+        if let Some(structure) = &self.structure {
+            self.db.reserve_vars(structure.root(), var_manager);
         }
     }
 }
@@ -188,16 +253,34 @@ impl BoundUpperIncremental for DynamicPolyWatchdog {
             return;
         }
         let n_vars_before = var_manager.n_used();
+        let mut fresh = false;
         if self.structure.is_none() && !self.in_lits.is_empty() {
-            self.structure = Some(build_lit_structure(
-                self.in_lits.iter().map(|(&l, &w)| (l, w)),
+            fresh = true;
+            self.structure = Some(build_structure(
+                &mut self.weight_queue,
+                self.prec_div,
+                true,
                 &mut self.db,
                 var_manager,
-            ));
+            ))
         }
-        match &self.structure {
+        match &mut self.structure {
             Some(structure) => {
                 let n_clauses_before = collector.n_clauses();
+                if !fresh
+                    && !self.weight_queue.is_empty()
+                    && self.weight_queue.iter().next_back().unwrap().0 >= &self.prec_div
+                {
+                    // precision has been increased, need to extend encoding
+                    let new_struct = build_structure(
+                        &mut self.weight_queue,
+                        self.prec_div,
+                        false,
+                        &mut self.db,
+                        var_manager,
+                    );
+                    merge_structures(structure, new_struct, &mut self.db, collector, var_manager);
+                }
                 let output_weight = 1 << (structure.output_power());
                 let output_range = range.start / output_weight..(range.end - 1) / output_weight + 1;
                 for oidx in output_range {
@@ -224,13 +307,17 @@ impl EncodeStats for DynamicPolyWatchdog {
 impl From<RsHashMap<Lit, usize>> for DynamicPolyWatchdog {
     fn from(lits: RsHashMap<Lit, usize>) -> Self {
         let weight_sum = lits.iter().fold(0, |sum, (_, w)| sum + *w);
+        let mut db = Default::default();
+        let weight_queue = lit_weight_queue(lits.clone().into_iter(), &mut db);
         Self {
-            in_lits: lits.clone(),
+            in_lits: lits,
             structure: Default::default(),
+            weight_queue,
+            prec_div: 1,
             weight_sum,
             n_vars: Default::default(),
             n_clauses: Default::default(),
-            db: Default::default(),
+            db,
         }
     }
 }
@@ -293,7 +380,7 @@ pub mod referenced {
 
         /// Gets the maximum depth of the tree
         pub fn depth(&self) -> usize {
-            self.db[self.structure.root].depth()
+            self.db[self.structure.root()].depth()
         }
     }
 
@@ -305,27 +392,27 @@ pub mod referenced {
 
         /// Gets the maximum depth of the tree
         pub fn depth(&self) -> usize {
-            self.db.borrow()[self.structure.root].depth()
+            self.db.borrow()[self.structure.root()].depth()
         }
     }
 
     impl Encode for DynamicPolyWatchdog<'_> {
         fn weight_sum(&self) -> usize {
             let output_weight = 1 << self.structure.output_power();
-            self.db[self.structure.root].len() * output_weight
+            self.db[self.structure.root()].len() * output_weight
         }
     }
 
     impl Encode for DynamicPolyWatchdogCell<'_> {
         fn weight_sum(&self) -> usize {
             let output_weight = 1 << self.structure.output_power();
-            self.db.borrow()[self.structure.root].len() * output_weight
+            self.db.borrow()[self.structure.root()].len() * output_weight
         }
     }
 
     impl EncodeIncremental for DynamicPolyWatchdog<'_> {
         fn reserve(&mut self, var_manager: &mut dyn ManageVars) {
-            self.db.reserve_vars(self.structure.root, var_manager);
+            self.db.reserve_vars(self.structure.root(), var_manager);
         }
     }
 
@@ -333,7 +420,7 @@ pub mod referenced {
         fn reserve(&mut self, var_manager: &mut dyn ManageVars) {
             self.db
                 .borrow_mut()
-                .reserve_vars(self.structure.root, var_manager);
+                .reserve_vars(self.structure.root(), var_manager);
         }
     }
 
@@ -445,27 +532,17 @@ type DpwIter<'a> = std::iter::Map<
 >;
 
 #[cfg_attr(feature = "internals", visibility::make(pub))]
-fn build_lit_structure<LI: Iterator<Item = (Lit, usize)>>(
-    lits: LI,
-    tot_db: &mut TotDb,
-    var_manager: &mut dyn ManageVars,
-) -> Structure {
+fn lit_weight_queue<LI: Iterator<Item = (Lit, usize)>>(lits: LI, tot_db: &mut TotDb) -> WeightQ {
     let lit_to_con = |(lit, weight)| {
         let node = tot_db.insert(Node::Leaf(lit));
         NodeCon::weighted(node, weight)
     };
-    let cons: Vec<_> = lits.map(lit_to_con).collect();
-    build_structure(cons.into_iter(), tot_db, var_manager)
+    con_weight_queue(lits.map(lit_to_con))
 }
 
 #[cfg_attr(feature = "internals", visibility::make(pub))]
-fn build_structure<CI: Iterator<Item = NodeCon>>(
-    cons: CI,
-    tot_db: &mut TotDb,
-    var_manager: &mut dyn ManageVars,
-) -> Structure {
-    // Initialize weight queue
-    let mut weight_queue: BTreeMap<usize, Vec<NodeCon>> = BTreeMap::new();
+fn con_weight_queue<CI: Iterator<Item = NodeCon>>(cons: CI) -> WeightQ {
+    let mut weight_queue: WeightQ = BTreeMap::new();
     for con in cons {
         if let Some(cons) = weight_queue.get_mut(&con.multiplier()) {
             cons.push(NodeCon {
@@ -482,20 +559,39 @@ fn build_structure<CI: Iterator<Item = NodeCon>>(
             );
         }
     }
+    weight_queue
+}
+
+#[cfg_attr(feature = "internals", visibility::make(pub))]
+fn build_structure(
+    weight_queue: &mut WeightQ,
+    prec_div: usize,
+    topmost: bool,
+    tot_db: &mut TotDb,
+    var_manager: &mut dyn ManageVars,
+) -> Structure {
+    // prec_div has to be a power of 2
+    debug_assert!(prec_div <= 1 || (prec_div & (prec_div - 1)) == 0);
+    let skipped_levels = utils::digits(prec_div, 2) as usize - 1;
+
     let basis_len = utils::digits(*weight_queue.iter().next_back().unwrap().0, 2) as usize;
+    let mut structure = Structure {
+        bottom_buckets: Vec::with_capacity(basis_len),
+        tares: Vec::with_capacity(basis_len - 1),
+    };
 
     // Children to be merged to a given top bucket
-    let mut top_buckets = vec![vec![]; basis_len];
+    let mut top_buckets = vec![vec![]; basis_len - skipped_levels];
     // Converts a digit number to a corresponding index in the
     // `top_buckets`. Top buckets are ordered from smallest to highest.
-    let tb_idx = |digits: u32| (digits - 1) as usize;
+    let tb_idx = |digits: usize| (digits - 1 - skipped_levels) as usize;
 
     // Loop while there are new weights that need to be added and distribute
     // them to relevant top buckets
-    while !weight_queue.is_empty() {
+    while !weight_queue.is_empty() && weight_queue.iter().next_back().unwrap().0 >= &prec_div {
         let (weight, cons) = weight_queue.pop_last().unwrap();
         let merged = tot_db.merge_balanced(&cons);
-        let digits = utils::digits(weight, 2);
+        let digits = utils::digits(weight, 2) as usize;
         let current_weight = 1 << (digits - 1);
         top_buckets[tb_idx(digits)].push(merged);
         // Insert remainder of totalizer as new child
@@ -509,69 +605,170 @@ fn build_structure<CI: Iterator<Item = NodeCon>>(
         }
     }
 
-    if basis_len == 1 {
+    if basis_len == 1 && topmost {
         debug_assert_eq!(top_buckets[0].len(), 1);
+        debug_assert_eq!(top_buckets[0][0].offset(), 0);
+        debug_assert_eq!(top_buckets[0][0].multiplier(), 1);
+        debug_assert_eq!(top_buckets[0][0].divisor(), 1);
+        debug_assert!(structure.bottom_buckets.is_empty());
         return Structure {
-            root: top_buckets[0][0].id,
+            bottom_buckets: vec![top_buckets[0][0].id],
             tares: vec![],
         };
     }
 
     // Prepare tares
-    let mut tares: Vec<_> = (0..basis_len - 1)
-        .map(|_| var_manager.new_var().pos_lit())
-        .collect();
-    let tare_nodes: Vec<_> = tares
+    structure.tares.extend(
+        (0..basis_len - skipped_levels - if topmost { 1 } else { 0 })
+            .map(|_| var_manager.new_var().pos_lit()),
+    );
+    let tare_nodes: Vec<_> = structure
+        .tares
         .iter()
         .map(|&lit| tot_db.insert(Node::Leaf(lit)))
         .collect();
-    tares.shrink_to_fit();
 
     // Merge top buckets and merge with bottom buckets
-    let mut last_bottom_bucket = None;
+    let mut bottom_buckets = Vec::with_capacity(basis_len - skipped_levels);
+    let mut bb_offset = 0;
     for (idx, mut cons) in top_buckets.into_iter().enumerate() {
-        if idx != basis_len - 1 {
+        let has_tare = if !topmost || idx != basis_len - skipped_levels - 1 {
             // Merge top bucket (except for last) with tare
             cons.push(NodeCon::full(tare_nodes[idx]));
-        }
+            true
+        } else {
+            false
+        };
         cons.sort_unstable_by_key(|&con| tot_db.con_len(con));
         let top_bucket = tot_db.merge_balanced(&cons);
-        if last_bottom_bucket.is_none() {
-            // special case: lowest bucket does not need bottom buckets
-            if tot_db.con_len(top_bucket) == 1 {
+        if bottom_buckets.is_empty() {
+            // special case: lowest bucket either gets dummy or no bottom bucket
+            // TODO: figure out how to skip levels in the middle if they are empty
+            if has_tare && tot_db.con_len(top_bucket) == 1 {
                 // top bucket is empty (except for tare), tare can be
                 // omitted: shift to next layer
                 continue;
             }
             debug_assert_eq!(top_bucket.divisor(), 1);
-            last_bottom_bucket = Some(NodeCon {
-                id: top_bucket.id,
-                offset: top_bucket.offset,
-                divisor: NonZeroU8::new(2).unwrap(),
-                multiplier: NonZeroUsize::new(1).unwrap(),
-                len_limit: None,
-            });
+            if prec_div <= 1 {
+                // very last bottom bucket does not need bottom bucket
+                bottom_buckets.push(top_bucket.id);
+                bb_offset = top_bucket.offset;
+            } else {
+                // last bottom bucket for this segment, leave dummy node to path in extension
+                let dummy = tot_db.insert(Node::Dummy);
+                let right = NodeCon::full(dummy);
+                let bottom = tot_db.insert(Node::internal(top_bucket, right, tot_db));
+                bottom_buckets.push(bottom);
+                bb_offset = 0;
+            }
             continue;
         }
 
-        let right = last_bottom_bucket.unwrap();
-        let bottom = tot_db.insert(Node::internal(top_bucket, right, tot_db));
-        last_bottom_bucket = Some(NodeCon {
-            id: bottom,
-            offset: 0,
+        let right = NodeCon {
+            id: *bottom_buckets.last().unwrap(),
+            offset: bb_offset,
             divisor: NonZeroU8::new(2).unwrap(),
             multiplier: NonZeroUsize::new(1).unwrap(),
             len_limit: None,
-        });
+        };
+        let bottom = tot_db.insert(Node::internal(top_bucket, right, tot_db));
+        bottom_buckets.push(bottom);
+        bb_offset = 0;
     }
 
-    let root = last_bottom_bucket.unwrap();
-    debug_assert_eq!(root.offset(), 0);
-    debug_assert_eq!(root.divisor(), 2);
-    Structure {
-        root: root.id,
-        tares,
+    debug_assert_eq!(bottom_buckets.len(), basis_len - skipped_levels);
+    structure
+        .bottom_buckets
+        .extend(bottom_buckets.into_iter().rev());
+    structure
+}
+
+#[cfg_attr(feature = "internals", visibility::make(pub))]
+fn merge_structures<Col>(
+    bot_struct: &mut Structure,
+    top_struct: Structure,
+    tot_db: &mut TotDb,
+    collector: &mut Col,
+    var_manager: &mut dyn ManageVars,
+) where
+    Col: CollectClauses,
+{
+    debug_assert_eq!(bot_struct.bottom_buckets.len(), bot_struct.tares.len() + 1);
+    debug_assert_eq!(top_struct.bottom_buckets.len(), top_struct.tares.len());
+    let last_bottom = *bot_struct.bottom_buckets.last().unwrap();
+    debug_assert_eq!(tot_db[tot_db[last_bottom].right().unwrap().id], Node::Dummy);
+    // patch together structures
+    match &mut tot_db[last_bottom] {
+        Node::Leaf(_) | Node::Dummy => panic!(),
+        Node::Unit(UnitNode { right, .. }) | Node::General(GeneralNode { right, .. }) => {
+            *right = NodeCon {
+                id: *top_struct.bottom_buckets.first().unwrap(),
+                offset: 0,
+                divisor: NonZeroU8::new(2).unwrap(),
+                multiplier: NonZeroUsize::new(1).unwrap(),
+                len_limit: None,
+            }
+        }
     }
+    // extend old bottom buckets
+    let mut old_right_max = 0;
+    for &bbid in bot_struct.bottom_buckets.iter().rev() {
+        let bot_buck = &tot_db[bbid];
+        let right = bot_buck.right().unwrap();
+        let right_max = tot_db.con_len(right);
+        let left = bot_buck.left().unwrap();
+        let left_max = tot_db.con_len(left);
+        debug_assert_eq!(right.divisor(), 2);
+        // encode outputs with new rlits
+        let bot_buck = tot_db[bbid].unit();
+        let olits_to_extend: Vec<_> = bot_buck
+            .lits
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, litdat)| {
+                if let &LitData::Lit { lit, enc_pos } = litdat {
+                    if enc_pos && idx + 1 >= old_right_max {
+                        return Some((lit, idx + 1));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (olit, val) in olits_to_extend {
+            for rval in tot_db[right.id].vals(
+                right.rev_map(old_right_max + 1)..right.rev_map(cmp::min(right_max + 1, val)) + 1,
+            ) {
+                let lval = val - right.map(rval);
+                if left.is_possible(lval) {
+                    let rlit = tot_db.define_pos_tot(right.id, rval - 1, collector, var_manager);
+                    if lval == 0 {
+                        collector.extend([atomics::lit_impl_lit(rlit, olit)]);
+                    } else {
+                        debug_assert_eq!(left.divisor(), 1);
+                        let llit = tot_db.define_pos_tot(left.id, lval - 1, collector, var_manager);
+                        collector.extend([atomics::cube_impl_lit(&[rlit, llit], olit)]);
+                    }
+                }
+            }
+        }
+        // next old right max
+        let bot_buck = tot_db[bbid].mut_unit();
+        old_right_max = bot_buck.lits.len() / 2;
+        // add new output literals
+        let len = right_max + left_max;
+        debug_assert!(bot_buck.lits.len() <= len);
+        bot_buck.lits.resize(len, LitData::None);
+    }
+    // extend structure
+    bot_struct.bottom_buckets.extend(top_struct.bottom_buckets);
+    let old_tares = bot_struct.tares.len();
+    bot_struct.tares.resize(
+        bot_struct.tares.len() + top_struct.tares.len(),
+        Lit::new(0, false),
+    );
+    bot_struct.tares[..].copy_within(..old_tares, top_struct.tares.len());
+    bot_struct.tares[..top_struct.tares.len()].copy_from_slice(&top_struct.tares)
 }
 
 #[cfg_attr(feature = "internals", visibility::make(pub))]
@@ -584,20 +781,20 @@ fn encode_output<Col>(
 ) where
     Col: CollectClauses,
 {
-    if oidx >= tot_db[dpw.root].max_val() {
+    if oidx >= tot_db[dpw.root()].max_val() {
         return;
     }
-    tot_db.define_pos_tot(dpw.root, oidx, collector, var_manager);
+    tot_db.define_pos_tot(dpw.root(), oidx, collector, var_manager);
 }
 
 #[cfg_attr(feature = "internals", visibility::make(pub))]
 fn enforce_ub(dpw: &Structure, ub: usize, tot_db: &TotDb) -> Result<Vec<Lit>, Error> {
     let output_weight = 1 << (dpw.output_power());
     let oidx = ub / output_weight;
-    if oidx >= tot_db[dpw.root].max_val() {
+    if oidx >= tot_db[dpw.root()].max_val() {
         return Ok(vec![]);
     }
-    let olit = match tot_db[dpw.root].lit(oidx + 1) {
+    let olit = match tot_db[dpw.root()].lit(oidx + 1) {
         Some(&lit) => lit,
         None => return Err(Error::NotEncoded),
     };
@@ -716,5 +913,42 @@ mod tests {
             let assumps = dpw.enforce_ub(coarse_ub).unwrap();
             debug_assert_eq!(assumps.len(), 1);
         }
+    }
+
+    #[test]
+    fn incremental_precision() {
+        let mut lits = RsHashMap::default();
+        lits.insert(lit![0], 5);
+        lits.insert(lit![1], 3);
+        lits.insert(lit![2], 8);
+        lits.insert(lit![3], 7);
+        let mut dpw = DynamicPolyWatchdog::from(lits);
+        let mut var_manager = BasicVarManager::default();
+        // step 1
+        debug_assert_eq!(dpw.next_precision(), 8);
+        dpw.set_precision(8).unwrap();
+        let mut cnf = Cnf::new();
+        dpw.encode_ub(0..=4, &mut cnf, &mut var_manager);
+        debug_assert!(!cnf.is_empty());
+        // step 2
+        debug_assert_eq!(dpw.next_precision(), 4);
+        dpw.set_precision(4).unwrap();
+        let mut cnf = Cnf::new();
+        dpw.encode_ub(0..=4, &mut cnf, &mut var_manager);
+        debug_assert!(!cnf.is_empty());
+        // step 3
+        debug_assert_eq!(dpw.next_precision(), 2);
+        dpw.set_precision(2).unwrap();
+        let mut cnf = Cnf::new();
+        dpw.encode_ub(0..=4, &mut cnf, &mut var_manager);
+        debug_assert!(!cnf.is_empty());
+        // step 3
+        debug_assert_eq!(dpw.next_precision(), 1);
+        dpw.set_precision(1).unwrap();
+        let mut cnf = Cnf::new();
+        dpw.encode_ub(0..=4, &mut cnf, &mut var_manager);
+        debug_assert!(!cnf.is_empty());
+        // last check
+        debug_assert_eq!(dpw.next_precision(), 1);
     }
 }

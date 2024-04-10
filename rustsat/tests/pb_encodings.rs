@@ -291,7 +291,7 @@ fn test_ub_exhaustive<PBE: BoundUpperIncremental + From<RsHashMap<Lit, usize>>>(
     let mut var_manager = BasicVarManager::default();
     var_manager.increase_next_free(var![4]);
 
-    let max_val = weights.iter().fold(0, |sum, &w| sum + w);
+    let max_val = weights.iter().sum::<usize>();
     let expected = |assign: usize, bound: usize| {
         let sum = (0..4).fold(0, |sum, idx| sum + ((assign >> idx) & 1) * weights[3 - idx]);
         if sum <= bound {
@@ -305,6 +305,7 @@ fn test_ub_exhaustive<PBE: BoundUpperIncremental + From<RsHashMap<Lit, usize>>>(
         if decreasing {
             bound = max_val - bound;
         }
+        println!("bound: {}", bound);
 
         enc.encode_ub_change(bound..bound + 1, &mut solver, &mut var_manager);
         let assumps = enc.enforce_ub(bound).unwrap();
@@ -415,3 +416,86 @@ generate_exhaustive!(
     tot_sim,
     simulators::Card<rustsat::encodings::card::Totalizer>
 );
+
+mod dpw_inc_prec {
+    use rustsat::{
+        encodings::pb::{dpw::DynamicPolyWatchdog, BoundUpper, BoundUpperIncremental},
+        instances::{BasicVarManager, Cnf, ManageVars},
+        lit,
+        solvers::{
+            Solve, SolveIncremental,
+            SolverResult::{Sat, Unsat},
+        },
+        types::RsHashMap,
+        var,
+    };
+    use rustsat_tools::{test_all, test_assignment};
+
+    #[test]
+    fn incremental_precision() {
+        let weights = [5, 8, 7, 3];
+        let mut lits = RsHashMap::default();
+        lits.insert(lit![0], weights[0]);
+        lits.insert(lit![1], weights[1]);
+        lits.insert(lit![2], weights[2]);
+        lits.insert(lit![3], weights[3]);
+        for decreasing in [false, true] {
+            println!("decreasing: {}", decreasing);
+            let mut solver = rustsat_minisat::core::Minisat::default();
+            let mut enc = DynamicPolyWatchdog::from(lits.clone());
+            let mut var_manager = BasicVarManager::default();
+            var_manager.increase_next_free(var![4]);
+
+            for prec in 0..3 {
+                let prec_div = 1 << (3 - prec);
+                println!("precision: {}", prec_div);
+                enc.set_precision(prec_div).unwrap();
+
+                let max_val = weights.iter().fold(0, |sum, &w| sum + (w / prec_div));
+                let expected = |assign: usize, bound: usize| {
+                    let sum = (0..4).fold(0, |sum, idx| {
+                        sum + ((assign >> idx) & 1) * (weights[3 - idx] / prec_div)
+                    });
+                    if sum <= bound {
+                        Sat
+                    } else {
+                        Unsat
+                    }
+                };
+
+                for mut bound in 0..=max_val {
+                    if decreasing {
+                        bound = max_val - bound;
+                    }
+                    println!("bound: {}", bound);
+                    let mut cnf = Cnf::default();
+                    enc.encode_ub_change(bound..bound + 1, &mut cnf, &mut var_manager);
+                    println!("extending encoding: {:?}", cnf);
+                    solver.add_cnf(cnf).unwrap();
+                    let assumps = enc.enforce_ub(bound).unwrap();
+
+                    test_all!(
+                        solver,
+                        assumps, //
+                        expected(0b1111, bound),
+                        expected(0b1110, bound),
+                        expected(0b1101, bound),
+                        expected(0b1100, bound),
+                        expected(0b1011, bound),
+                        expected(0b1010, bound),
+                        expected(0b1001, bound),
+                        expected(0b1000, bound),
+                        expected(0b0111, bound),
+                        expected(0b0110, bound),
+                        expected(0b0101, bound),
+                        expected(0b0100, bound),
+                        expected(0b0011, bound),
+                        expected(0b0010, bound),
+                        expected(0b0001, bound),
+                        expected(0b0000, bound)
+                    );
+                }
+            }
+        }
+    }
+}

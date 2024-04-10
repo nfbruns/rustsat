@@ -16,7 +16,7 @@ typedef enum MaybeError {
   /**
    * No error
    */
-  Ok,
+  Ok = 0,
   /**
    * Encode was not called before using the encoding
    */
@@ -29,6 +29,18 @@ typedef enum MaybeError {
    * The encoding is in an invalid state to perform this action
    */
   InvalidState,
+  /**
+   * Invalid IPASIR-style literal
+   */
+  InvalidLiteral,
+  /**
+   * Precision divisor is not a power of 2
+   */
+  PrecisionNotPow2,
+  /**
+   * Attempting to decrease precision
+   */
+  PrecisionDecreased,
 } MaybeError;
 
 /**
@@ -69,9 +81,14 @@ extern "C" {
 #endif // __cplusplus
 
 /**
- * Adds a new input literal to a [`DynamicPolyWatchdog`]. Input
- * literals can only be added _before_ the encoding is built for the
- * first time. Otherwise [`MaybeError::InvalidState`] is returned.
+ * Adds a new input literal to a [`DynamicPolyWatchdog`].
+ *
+ * # Errors
+ *
+ * - If `lit` is not a valid IPASIR-style literal (e.g., `lit = 0`),
+ *   [`MaybeError::InvalidLiteral`] is returned
+ * - If a literal is added _after_ the encoding is build, [`MaybeError::InvalidState`] is
+ *   returned
  *
  * # Safety
  *
@@ -153,14 +170,49 @@ enum MaybeError dpw_enforce_ub(struct DynamicPolyWatchdog *dpw,
 struct DynamicPolyWatchdog *dpw_new(void);
 
 /**
+ * Gets the next possible precision divisor value
+ *
+ * Note that this is not the next possible precision value from the last _set_ precision but
+ * from the last _encoded_ precision. The divisor value will always be a power of two so that
+ * calling `set_precision` and then encoding will produce the smalles non-empty next segment
+ * of the encoding.
+ */
+size_t dpw_next_precision(struct DynamicPolyWatchdog *dpw);
+
+/**
+ * Set the precision at which to build the encoding at. With `divisor = 8` the encoding will
+ * effectively be built such that the weight of every input literal is divided by `divisor`
+ * (interger division, rounding down). Divisor values must be powers of 2. After building
+ * the encoding, the precision can only be increased, i.e., only call this function with
+ * _decreasing_ divisor values.
+ *
+ * # Errors
+ *
+ * - If `divisor` is not a power of 2, [`MaybeError::PrecisionNotPow2`] is returned
+ * - If `divisor` is larger than the last divisor, i.e., precision is attemted to be
+ *   decreased, [`MaybeError::PrecisionDecreased`] is returned
+ *
+ * # Safety
+ *
+ * `dpw` must be a return value of [`dpw_new`] that [`dpw_drop`] has
+ * not yet been called on.
+ */
+enum MaybeError dpw_set_precision(struct DynamicPolyWatchdog *dpw, size_t divisor);
+
+/**
  * Adds a new input literal to a [`DbTotalizer`]
+ *
+ * # Errors
+ *
+ * - If `lit` is not a valid IPASIR-style literal (e.g., `lit = 0`),
+ *   [`MaybeError::InvalidLiteral`] is returned
  *
  * # Safety
  *
  * `tot` must be a return value of [`tot_new`] that [`tot_drop`] has
  * not yet been called on.
  */
-void tot_add(struct DbTotalizer *tot, int lit);
+enum MaybeError tot_add(struct DbTotalizer *tot, int lit);
 
 /**
  * Frees the memory associated with a [`DbTotalizer`]
