@@ -6,9 +6,7 @@ members = [
   "glucose",
   "minisat",
   "ipasir",
-  "solvertests",
-  "capi",
-  "pyapi",
+  "batsat",
 ]
 resolver = "2"
 
