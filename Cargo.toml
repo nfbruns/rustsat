@@ -10,6 +10,7 @@ members = [
   "solvertests",
   "capi",
   "pyapi",
+  "batsat",
 ]
 resolver = "2"
 
