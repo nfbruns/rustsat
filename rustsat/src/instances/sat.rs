@@ -304,6 +304,15 @@ impl<VM: ManageVars> SatInstance<VM> {
         }
     }
 
+    pub fn from_cnf_and_manager(cnf: Cnf, var_manager: VM) -> Self {
+        SatInstance {
+            cnf,
+            cards: vec![],
+            pbs: vec![],
+            var_manager,
+        }
+    }
+
     /// Returns the number of clauses in the instance
     pub fn n_clauses(&self) -> usize {
         self.cnf.n_clauses()
