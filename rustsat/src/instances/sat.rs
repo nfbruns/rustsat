@@ -303,7 +303,7 @@ impl<VM: ManageVars> SatInstance<VM> {
             var_manager,
         }
     }
-
+    /// Creates a new satisfiability instance from an cnf with a specific var manager
     pub fn from_cnf_and_manager(cnf: Cnf, var_manager: VM) -> Self {
         SatInstance {
             cnf,
